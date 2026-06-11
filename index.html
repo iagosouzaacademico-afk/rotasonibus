@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Rotas de Ônibus</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: sans-serif; overflow: hidden; } 
+        #sidebar { 
+            position: absolute; left: 0; top: 0; bottom: 0; width: 250px; 
+            padding: 15px; background: #f4f4f4; overflow-y: auto; 
+            box-sizing: border-box; border-right: 1px solid #ccc; z-index: 1000; 
+        }
+        #map { position: absolute; left: 250px; right: 0; top: 0; bottom: 0; z-index: 1; }
+        #map:focus, .leaflet-container:focus, path:focus { outline: none !important; }
+        .lista-rotas { max-height: 150px; overflow-y: auto; }
+        .rota-item { display: block; padding: 5px 0; border-bottom: 1px solid #ddd; text-decoration: none; color: #0052cc; }
+        .rota-item:hover { font-weight: bold; background: #fff; }
+        .selecionar-todas { color: #2e7d32; font-weight: bold; }
+        .empresa-label { display: block; margin-bottom: 8px; cursor: pointer; font-size: 14px; }
+        summary { font-size: 18px; font-weight: bold; cursor: pointer; user-select: none; margin-bottom: 10px; }
+        hr { border: 0; border-top: 1px solid #ccc; margin: 15px 0; }
+    </style>
+</head>
+<body>
+    <div id="sidebar">
+        <details open>
+            <summary>Mapa de Fundo</summary>
+            <div>
+                <label class="empresa-label"><input type="radio" name="mapa-fundo" value="osm" checked> OpenStreetMap</label>
+                <label class="empresa-label"><input type="radio" name="mapa-fundo" value="google"> Google Satélite</label>
+            </div>
+        </details>
+
+        <hr>
+
+        <details open>
+            <summary>Camadas</summary>
+            <div>
+                <label class="empresa-label"><input type="checkbox" id="check-bairros"> Bairros</label>
+                <label class="empresa-label"><input type="checkbox" id="check-vizinhanca"> Vizinhança</label>
+            </div>
+        </details>
+        
+        <hr>
+
+        <details>
+            <summary>Empresas</summary>
+            <div>
+                <label class="empresa-label"><input type="checkbox" id="check-todas" checked> <b>Selecionar Todas</b></label>
+                <hr>
+                <div id="filtro-empresas"></div>
+            </div>
+        </details>
+    </div>
+    <div id="map"></div>
+    
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+    <script src="https://unpkg.com/leaflet-polylinedecorator/dist/leaflet.polylineDecorator.js"></script>
+    
+    <script>
+        var map = L.map('map').setView([-5.7944, -35.2110], 12);
+        
+        var osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        var googleLayer = L.tileLayer('https://{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}', {
+            maxZoom: 20,
+            subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+            attribution: '© Google Maps'
+        });
+
+        document.querySelectorAll('input[name="mapa-fundo"]').forEach(radio => {
+            radio.addEventListener('change', function(e) {
+                if (e.target.value === 'google') {
+                    map.removeLayer(osmLayer);
+                    googleLayer.addTo(map);
+                } else {
+                    map.removeLayer(googleLayer);
+                    osmLayer.addTo(map);
+                }
+            });
+        });
+
+        let rotasDestacadas = [];
+        let rotasLayer = null;
+        let bairrosLayer = null;
+        let vizinhancaLayer = null;
+        let bairroDestacado = null;
+        let ultimoClique = null;
+        let geojsonData = null;
+        
+        // Camada isolada para controlar e limpar as setas dinamicamente
+        let decoradoresLayer = L.layerGroup().addTo(map);
+
+        function getEmpresa(prop) {
+            if (!prop) return 'Sem Empresa';
+            let chave = Object.keys(prop).find(k => k.toLowerCase() === 'empresa');
+            return chave ? String(prop[chave]) : 'Sem Empresa';
+        }
+
+        function getNomeBairro(prop) {
+            if (!prop) return 'Nome indisponível';
+            let chave = Object.keys(prop).find(k => k.toLowerCase() === 'nome' || k.toLowerCase() === 'name' || k.toLowerCase() === 'bairro');
+            return chave ? String(prop[chave]) : 'Nome indisponível';
+        }
+
+        function determinarTipoCamada(prop) {
+            if (!prop) return 'bairro';
+            let chave = Object.keys(prop).find(k => k.toLowerCase() === 'tipo');
+            if (chave) {
+                let val = String(prop[chave]).toLowerCase();
+                if (val.includes('vizinhanca') || val.includes('vizinhança')) {
+                    return 'vizinhanca';
+                }
+            }
+            return 'bairro';
+        }
+
+        fetch('linhas.json')
+            .then(res => res.json())
+            .then(data => {
+                geojsonData = data;
+                let empresas = [...new Set(data.features.map(f => getEmpresa(f.properties)))].sort();
+                let container = document.getElementById('filtro-empresas');
+                
+                empresas.forEach(emp => {
+                    container.innerHTML += `<label class="empresa-label"><input type="checkbox" class="check-empresa" value="${emp}" checked> ${emp}</label>`;
+                });
+
+                document.getElementById('check-todas').addEventListener('change', function(e) {
+                    document.querySelectorAll('.check-empresa').forEach(cb => cb.checked = e.target.checked);
+                    atualizarMapa();
+                });
+
+                document.querySelectorAll('.check-empresa').forEach(cb => {
+                    cb.addEventListener('change', atualizarMapa);
+                });
+
+                atualizarMapa();
+            });
+
+        fetch('bairros.json')
+            .then(res => res.json())
+            .then(data => {
+                bairrosLayer = L.geoJSON(data, {
+                    filter: function(f) { return determinarTipoCamada(f.properties) === 'bairro'; },
+                    style: { color: '#ff5722', weight: 1.5, fillOpacity: 0.05 },
+                    onEachFeature: function(feature, layer) {
+                        layer.bindTooltip(getNomeBairro(feature.properties), { sticky: true });
+                    }
+                });
+
+                vizinhancaLayer = L.geoJSON(data, {
+                    filter: function(f) { return determinarTipoCamada(f.properties) === 'vizinhanca'; },
+                    style: { color: '#9c27b0', weight: 1, dashArray: '4', fillOpacity: 0.02 },
+                    onEachFeature: function(feature, layer) {
+                        layer.bindTooltip(getNomeBairro(feature.properties), { sticky: true });
+                    }
+                });
+
+                document.getElementById('check-bairros').addEventListener('change', function(e) {
+                    if (e.target.checked) bairrosLayer.addTo(map);
+                    else {
+                        map.removeLayer(bairrosLayer);
+                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'bairro') {
+                            bairroDestacado = null;
+                        }
+                    }
+                });
+
+                document.getElementById('check-vizinhanca').addEventListener('change', function(e) {
+                    if (e.target.checked) vizinhancaLayer.addTo(map);
+                    else {
+                        map.removeLayer(vizinhancaLayer);
+                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'vizinhanca') {
+                            bairroDestacado = null;
+                        }
+                    }
+                });
+            }).catch(err => console.log('Erro ao carregar bairros.json:', err));
+
+        function atualizarMapa() {
+            if (rotasLayer) map.removeLayer(rotasLayer);
+            decoradoresLayer.clearLayers();
+            
+            let checkboxes = document.querySelectorAll('.check-empresa:checked');
+            let selecionadas = Array.from(checkboxes).map(cb => cb.value);
+            
+            let checkTodas = document.getElementById('check-todas');
+            if(checkTodas) {
+                checkTodas.checked = selecionadas.length === document.querySelectorAll('.check-empresa').length;
+            }
+
+            let featuresFiltradas = geojsonData.features.filter(f => selecionadas.includes(getEmpresa(f.properties)));
+            let totalRotas = featuresFiltradas.length;
+            
+            let opacidadeDinamica = totalRotas > 0 ? Math.max(0.15, Math.min(0.8, 3 / totalRotas)) : 0.15;
+
+            rotasLayer = L.geoJSON(geojsonData, {
+                interactive: false,
+                filter: function(feature) {
+                    return selecionadas.includes(getEmpresa(feature.properties));
+                },
+                style: function () {
+                    return { color: '#0052cc', weight: 6, opacity: opacidadeDinamica };
+                }
+            }).addTo(map);
+            
+            if (selecionadas.length > 0 && rotasLayer.getLayers().length > 0) {
+                map.fitBounds(rotasLayer.getBounds());
+            }
+        }
+
+        function limparDestaques() {
+            rotasDestacadas.forEach(layer => {
+                if(rotasLayer.hasLayer(layer)) rotasLayer.resetStyle(layer);
+            });
+            rotasDestacadas = [];
+            decoradoresLayer.clearLayers(); // Remove todas as setas ao limpar seleção
+        }
+
+        function destacarLayer(layer) {
+            layer.setStyle({ color: '#ffeb3b', weight: 8, opacity: 1 });
+            if (!L.Browser.ie && !L.Browser.opera && !L.Browser.edge) {
+                layer.bringToFront();
+            }
+            rotasDestacadas.push(layer);
+
+            // Cria e insere as setas apenas na linha que está sendo destacada agora
+            L.polylineDecorator(layer, {
+                patterns: [
+                    {
+                        offset: '10%', 
+                        repeat: '100px', 
+                        symbol: L.Symbol.arrowHead({
+                            pixelSize: 12,
+                            pathOptions: { color: '#000000', fillOpacity: 0.9, stroke: false }
+                        })
+                    }
+                ]
+            }).addTo(decoradoresLayer);
+        }
+
+        window.selecionarRota = function(leafletId) {
+            limparDestaques();
+            let layer = rotasLayer.getLayer(leafletId);
+            if(layer) {
+                destacarLayer(layer);
+                map.closePopup();
+                
+                let prop = layer.feature.properties;
+                if(prop) {
+                    let detalhes = Object.keys(prop).map(k => `<b>${k}:</b> ${prop[k]}`).join('<br>');
+                    L.popup().setLatLng(ultimoClique).setContent(detalhes).openOn(map);
+                }
+            }
+        };
+
+        window.selecionarTodas = function(ids) {
+            limparDestaques();
+            ids.split(',').forEach(id => {
+                let layer = rotasLayer.getLayer(parseInt(id));
+                if(layer) destacarLayer(layer);
+            });
+            map.closePopup();
+        };
+
+        map.on('click', function(e) {
+            if (!rotasLayer) return;
+
+            ultimoClique = e.latlng;
+            let pt = turf.point([e.latlng.lng, e.latlng.lat]);
+
+            let poligonoEncontrado = null;
+            [bairrosLayer, vizinhancaLayer].forEach(function(layerCamada) {
+                if (layerCamada && map.hasLayer(layerCamada)) {
+                    layerCamada.eachLayer(function(layer) {
+                        try {
+                            if (turf.booleanPointInPolygon(pt, layer.feature)) {
+                                poligonoEncontrado = layer;
+                            }
+                        } catch(err) {}
+                    });
+                }
+            });
+            
+            if (poligonoEncontrado) {
+                if (bairroDestacado) {
+                    let tipoAntigo = determinarTipoCamada(bairroDestacado.feature.properties);
+                    if (tipoAntigo === 'bairro') bairrosLayer.resetStyle(bairroDestacado);
+                    else vizinhancaLayer.resetStyle(bairroDestacado);
+                }
+                bairroDestacado = poligonoEncontrado;
+                let tipoNovo = determinarTipoCamada(bairroDestacado.feature.properties);
+                let corDestaque = tipoNovo === 'bairro' ? '#ff5722' : '#9c27b0';
+                bairroDestacado.setStyle({ fillColor: corDestaque, fillOpacity: 0.3, weight: 3 });
+            } else {
+                if (bairroDestacado) {
+                    let tipoAntigo = determinarTipoCamada(bairroDestacado.feature.properties);
+                    if (tipoAntigo === 'bairro') bairrosLayer.resetStyle(bairroDestacado);
+                    else vizinhancaLayer.resetStyle(bairroDestacado);
+                    bairroDestacado = null;
+                }
+            }
+
+            let encontradas = [];
+            rotasLayer.eachLayer(function(layer) {
+                try {
+                    let feat = layer.feature;
+                    let dist = Infinity;
+                    
+                    if (feat.geometry.type === 'LineString') {
+                        dist = turf.pointToLineDistance(pt, feat);
+                    } else if (feat.geometry.type === 'MultiLineString') {
+                        let linesFlat = turf.flatten(feat);
+                        turf.featureEach(linesFlat, function(linhaSimples) {
+                            let d = turf.pointToLineDistance(pt, linhaSimples);
+                            if (d < dist) dist = d;
+                        });
+                    }
+                    
+                    if (dist < 0.05) encontradas.push(layer);
+                } catch (err) {}
+            });
+
+            if (encontradas.length > 0) {
+                let html = `<div class="lista-rotas"><b>Rotas neste local (${encontradas.length}):</b><br>`;
+                
+                if (encontradas.length > 1) {
+                    let ids = encontradas.map(l => l._leaflet_id).join(',');
+                    html += `<a href="#" class="rota-item selecionar-todas" onclick="selecionarTodas('${ids}'); return false;">[ Selecionar Todas ]</a>`;
+                }
+
+                encontradas.forEach(layer => {
+                    let prop = layer.feature.properties;
+                    let nome = prop ? (Object.values(prop)[0] || "Rota") : "Rota"; 
+                    html += `<a href="#" class="rota-item" onclick="selecionarRota(${layer._leaflet_id}); return false;">${nome}</a>`;
+                });
+                html += `</div>`;
+
+                L.popup().setLatLng(e.latlng).setContent(html).openOn(map);
+            } else if (rotasDestacadas.length > 0) {
+                limparDestaques();
+            }
+        });
+    </script>
+</body>
+</html>

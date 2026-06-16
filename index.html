@@ -39,6 +39,7 @@
             <div>
                 <label class="empresa-label"><input type="checkbox" id="check-bairros"> Bairros</label>
                 <label class="empresa-label"><input type="checkbox" id="check-vizinhanca"> Vizinhança</label>
+                <label class="empresa-label"><input type="checkbox" id="check-densidade"> Densidade de Rotas</label>
             </div>
         </details>
         
@@ -88,11 +89,10 @@
         let rotasLayer = null;
         let bairrosLayer = null;
         let vizinhancaLayer = null;
+        let densidadeLayer = null;
         let bairroDestacado = null;
         let ultimoClique = null;
         let geojsonData = null;
-        
-        // Camada isolada para controlar e limpar as setas dinamicamente
         let decoradoresLayer = L.layerGroup().addTo(map);
 
         function getEmpresa(prop) {
@@ -119,10 +119,67 @@
             return 'bairro';
         }
 
+        function getColorDensidade(d, max) {
+            let pct = d / max;
+            return pct > 0.8 ? '#800026' :
+                   pct > 0.6 ? '#E31A1C' :
+                   pct > 0.4 ? '#FD8D3C' :
+                   pct > 0.2 ? '#FEB24C' :
+                               '#FFEDA0';
+        }
+
+        function gerarCamadaDensidade(data) {
+            let segmentCounts = {};
+            
+            turf.featureEach(data, function (feat) {
+                let lines = feat.geometry.type === 'MultiLineString' ? turf.flatten(feat) : turf.featureCollection([feat]);
+                turf.featureEach(lines, function(line) {
+                    let coords = line.geometry.coordinates;
+                    for (let i = 0; i < coords.length - 1; i++) {
+                        let p1 = coords[i];
+                        let p2 = coords[i+1];
+                        let k1 = p1[0]+','+p1[1];
+                        let k2 = p2[0]+','+p2[1];
+                        let key = k1 < k2 ? k1+'|'+k2 : k2+'|'+k1;
+                        
+                        if (segmentCounts[key]) {
+                            segmentCounts[key].count += 1;
+                        } else {
+                            segmentCounts[key] = { count: 1, coords: [p1, p2] };
+                        }
+                    }
+                });
+            });
+
+            let maxCount = Math.max(...Object.values(segmentCounts).map(s => s.count));
+            
+            let features = Object.values(segmentCounts).map(seg => turf.lineString(seg.coords, { count: seg.count }));
+            
+            // Ordenação para garantir que densidades maiores fiquem por cima
+            features.sort((a, b) => a.properties.count - b.properties.count);
+            
+            let geojsonDensidade = turf.featureCollection(features);
+
+            densidadeLayer = L.geoJSON(geojsonDensidade, {
+                style: function(feature) {
+                    return {
+                        color: getColorDensidade(feature.properties.count, maxCount),
+                        weight: 5,
+                        opacity: 0.9
+                    };
+                },
+                onEachFeature: function(feature, layer) {
+                    layer.bindTooltip(`<b>Densidade:</b> ${feature.properties.count} rota(s)`, { sticky: true });
+                }
+            });
+        }
+
         fetch('linhas.json')
             .then(res => res.json())
             .then(data => {
                 geojsonData = data;
+                gerarCamadaDensidade(data);
+
                 let empresas = [...new Set(data.features.map(f => getEmpresa(f.properties)))].sort();
                 let container = document.getElementById('filtro-empresas');
                 
@@ -137,6 +194,16 @@
 
                 document.querySelectorAll('.check-empresa').forEach(cb => {
                     cb.addEventListener('change', atualizarMapa);
+                });
+
+                document.getElementById('check-densidade').addEventListener('change', function(e) {
+                    if (e.target.checked) {
+                        if (rotasLayer) map.removeLayer(rotasLayer);
+                        densidadeLayer.addTo(map);
+                    } else {
+                        map.removeLayer(densidadeLayer);
+                        atualizarMapa();
+                    }
                 });
 
                 atualizarMapa();
@@ -165,9 +232,7 @@
                     if (e.target.checked) bairrosLayer.addTo(map);
                     else {
                         map.removeLayer(bairrosLayer);
-                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'bairro') {
-                            bairroDestacado = null;
-                        }
+                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'bairro') bairroDestacado = null;
                     }
                 });
 
@@ -175,14 +240,14 @@
                     if (e.target.checked) vizinhancaLayer.addTo(map);
                     else {
                         map.removeLayer(vizinhancaLayer);
-                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'vizinhanca') {
-                            bairroDestacado = null;
-                        }
+                        if (bairroDestacado && determinarTipoCamada(bairroDestacado.feature.properties) === 'vizinhanca') bairroDestacado = null;
                     }
                 });
             }).catch(err => console.log('Erro ao carregar bairros.json:', err));
 
         function atualizarMapa() {
+            if (document.getElementById('check-densidade').checked) return;
+
             if (rotasLayer) map.removeLayer(rotasLayer);
             decoradoresLayer.clearLayers();
             
@@ -196,7 +261,6 @@
 
             let featuresFiltradas = geojsonData.features.filter(f => selecionadas.includes(getEmpresa(f.properties)));
             let totalRotas = featuresFiltradas.length;
-            
             let opacidadeDinamica = totalRotas > 0 ? Math.max(0.15, Math.min(0.8, 3 / totalRotas)) : 0.15;
 
             rotasLayer = L.geoJSON(geojsonData, {
@@ -216,30 +280,20 @@
 
         function limparDestaques() {
             rotasDestacadas.forEach(layer => {
-                if(rotasLayer.hasLayer(layer)) rotasLayer.resetStyle(layer);
+                if(rotasLayer && rotasLayer.hasLayer(layer)) rotasLayer.resetStyle(layer);
             });
             rotasDestacadas = [];
-            decoradoresLayer.clearLayers(); // Remove todas as setas ao limpar seleção
+            decoradoresLayer.clearLayers();
         }
 
         function destacarLayer(layer) {
             layer.setStyle({ color: '#ffeb3b', weight: 8, opacity: 1 });
-            if (!L.Browser.ie && !L.Browser.opera && !L.Browser.edge) {
-                layer.bringToFront();
-            }
+            if (!L.Browser.ie && !L.Browser.opera && !L.Browser.edge) layer.bringToFront();
             rotasDestacadas.push(layer);
 
-            // Cria e insere as setas apenas na linha que está sendo destacada agora
             L.polylineDecorator(layer, {
                 patterns: [
-                    {
-                        offset: '10%', 
-                        repeat: '100px', 
-                        symbol: L.Symbol.arrowHead({
-                            pixelSize: 12,
-                            pathOptions: { color: '#000000', fillOpacity: 0.9, stroke: false }
-                        })
-                    }
+                    { offset: '10%', repeat: '100px', symbol: L.Symbol.arrowHead({ pixelSize: 12, pathOptions: { color: '#000000', fillOpacity: 0.9, stroke: false } }) }
                 ]
             }).addTo(decoradoresLayer);
         }
@@ -250,7 +304,6 @@
             if(layer) {
                 destacarLayer(layer);
                 map.closePopup();
-                
                 let prop = layer.feature.properties;
                 if(prop) {
                     let detalhes = Object.keys(prop).map(k => `<b>${k}:</b> ${prop[k]}`).join('<br>');
@@ -269,6 +322,7 @@
         };
 
         map.on('click', function(e) {
+            if (document.getElementById('check-densidade').checked) return;
             if (!rotasLayer) return;
 
             ultimoClique = e.latlng;
@@ -279,9 +333,7 @@
                 if (layerCamada && map.hasLayer(layerCamada)) {
                     layerCamada.eachLayer(function(layer) {
                         try {
-                            if (turf.booleanPointInPolygon(pt, layer.feature)) {
-                                poligonoEncontrado = layer;
-                            }
+                            if (turf.booleanPointInPolygon(pt, layer.feature)) poligonoEncontrado = layer;
                         } catch(err) {}
                     });
                 }
@@ -295,8 +347,7 @@
                 }
                 bairroDestacado = poligonoEncontrado;
                 let tipoNovo = determinarTipoCamada(bairroDestacado.feature.properties);
-                let corDestaque = tipoNovo === 'bairro' ? '#ff5722' : '#9c27b0';
-                bairroDestacado.setStyle({ fillColor: corDestaque, fillOpacity: 0.3, weight: 3 });
+                bairroDestacado.setStyle({ fillColor: tipoNovo === 'bairro' ? '#ff5722' : '#9c27b0', fillOpacity: 0.3, weight: 3 });
             } else {
                 if (bairroDestacado) {
                     let tipoAntigo = determinarTipoCamada(bairroDestacado.feature.properties);
@@ -311,36 +362,30 @@
                 try {
                     let feat = layer.feature;
                     let dist = Infinity;
-                    
-                    if (feat.geometry.type === 'LineString') {
-                        dist = turf.pointToLineDistance(pt, feat);
-                    } else if (feat.geometry.type === 'MultiLineString') {
+                    if (feat.geometry.type === 'LineString') dist = turf.pointToLineDistance(pt, feat);
+                    else if (feat.geometry.type === 'MultiLineString') {
                         let linesFlat = turf.flatten(feat);
                         turf.featureEach(linesFlat, function(linhaSimples) {
                             let d = turf.pointToLineDistance(pt, linhaSimples);
                             if (d < dist) dist = d;
                         });
                     }
-                    
                     if (dist < 0.05) encontradas.push(layer);
                 } catch (err) {}
             });
 
             if (encontradas.length > 0) {
                 let html = `<div class="lista-rotas"><b>Rotas neste local (${encontradas.length}):</b><br>`;
-                
                 if (encontradas.length > 1) {
                     let ids = encontradas.map(l => l._leaflet_id).join(',');
                     html += `<a href="#" class="rota-item selecionar-todas" onclick="selecionarTodas('${ids}'); return false;">[ Selecionar Todas ]</a>`;
                 }
-
                 encontradas.forEach(layer => {
                     let prop = layer.feature.properties;
                     let nome = prop ? (Object.values(prop)[0] || "Rota") : "Rota"; 
                     html += `<a href="#" class="rota-item" onclick="selecionarRota(${layer._leaflet_id}); return false;">${nome}</a>`;
                 });
                 html += `</div>`;
-
                 L.popup().setLatLng(e.latlng).setContent(html).openOn(map);
             } else if (rotasDestacadas.length > 0) {
                 limparDestaques();
